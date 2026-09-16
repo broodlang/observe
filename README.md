@@ -14,9 +14,27 @@ in an isolated listener). `observe` is the part that gets a record *out* of the 
 (observe/start {:provider (observe-appsignal/provider {:api-key … :log-key …})
                 :env "prod" :revision "abc123" :app "hive"})
 
-(log/add-backend (observe/log-backend {:min-level :info}))   ; every log line
-(observe/attach-hatch)                                       ; hatch request timings + crashes
+(observe/attach-all)   ; everything below, in one call
+```
 
+`attach-all` is what a hatch app on `store` gets without writing a line of
+instrumentation — the Phoenix/Ecto-integration idea:
+
+| source | event | becomes |
+|---|---|---|
+| hatch `http/server` | `[:hatch :request :stop]` | `request_duration` timing by route, method, status |
+| | `[:hatch :request :exception]` | an error report (`web` namespace) |
+| hatch live / channels | `[:hatch :live :exception]`, `[:hatch :channel :exception]` | error reports |
+| hatch rate limiter | `[:hatch :ratelimit :denied]` | `ratelimit_denied` count by method, path |
+| `store` repo | `[:store :query :stop]` | `query_duration` timing by statement kind and table |
+| | `[:store :query :exception]` | an error report with the SQL (`store` namespace) |
+| the runtime | every abnormal process exit (`proc/system-monitor`) | an error report (`process` namespace), one per crash site per minute |
+
+Each piece is also separate — `attach-hatch`, `attach-store`, `attach-crashes` — and the
+rest is by hand:
+
+```brood
+(log/add-backend (observe/log-backend {:min-level :info}))   ; every log line
 (observe/report caught-error {:action "nightly-sync"})       ; a caught error
 (observe/gauge "queue_depth" 42 {:queue "mail"})
 (observe/counter "signups")
@@ -24,6 +42,13 @@ in an isolated listener). `observe` is the part that gets a record *out* of the 
 
 (observe/stats)      ; {:pending {…} :in-flight #{} :shipped n :failed n :dropped n}
 (observe/flush-sync) ; drain before a shutdown
+```
+
+Several providers at once — a local copy next to the vendor
+([`observe-local`](../observe-local)), or two vendors while migrating:
+
+```brood
+(observe/fan-out-provider [(observe-local/provider) (observe-appsignal/provider {…})])
 ```
 
 Every entry point is one `send` to the shipper process. It batches per kind

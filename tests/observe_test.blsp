@@ -84,7 +84,7 @@
 
 (describe "failure"
   :isolated (test "a refusing provider is counted, and the entries are not retried"
-    (let (provider (fresh {:fail? true}))
+    (let (_ (fresh {:fail? true}))
       (observe/gauge "x" 1)
       (observe/gauge "y" 2)
       (observe/flush-sync)
@@ -95,7 +95,7 @@
       (observe/stop)))
 
   (test "a provider that raises is a failure, not a dead shipper"
-    (let (provider (fresh {:fail? true}))
+    (let (_ (fresh {:fail? true}))
       (observe/report "boom")
       (observe/flush-sync)
       (assert= 1 (get (observe/stats) :failed))
@@ -225,4 +225,114 @@
       (letrec (drain (fn (n) (receive ([:line _] (drain (+ n 1))) (after 50 n))))
         (assert= 1 (drain 0)))
       (assert= 3 (get (observe/stats) :failed))
+      (observe/stop))))
+
+(describe "process crashes"
+  :isolated (test "a raise in a spawned process is reported once, with the fault's name and site"
+    (let (provider (fresh))
+      (observe/attach-crashes)
+      (spawn (fn () (error "worker/step: bad input: " 42)))
+      (spawn (fn () (+ 1 "x")))
+      (spawn (fn () nil))
+      (sleep 100)
+      (observe/flush-sync)
+      (observe/detach-crashes)
+      (let (reports (entries provider :errors)
+            names (vec (sort (map reports (fn (r) (get r :name))))))
+        (assert= ["E0030" "worker/step"] names)
+        (for (r reports)
+          (assert= "process" (get r :namespace))
+          (is (string? (get (get r :tags) :pid)))))
+      (observe/stop)))
+
+  (test "the same site repeats at most once per interval"
+    (let (provider (fresh))
+      (observe/attach-crashes)
+      (for (_ (range 0 5)) (spawn (fn () (error "loop/step: again"))))
+      (sleep 100)
+      (observe/flush-sync)
+      (observe/detach-crashes)
+      (assert= 1 (count (entries provider :errors)))
+      (observe/stop))))
+
+(describe "crash-report"
+  (test "unwraps the kernel's [:error fault] and names the fault"
+    (let (r (observe/crash-report :pid-1
+              [:error {:kind :user :message "worker/step: bad" :line 3 :col 9 :file "src/w.blsp"}]))
+      (assert= "worker/step" (get r :name))
+      (assert= "worker/step: bad" (get r :message))
+      (assert= ["src/w.blsp:3:9"] (get r :backtrace))
+      (assert= "process" (get r :namespace))))
+  (test "clean exits are not crashes"
+    (assert= nil (observe/crash-report :p :normal))
+    (assert= nil (observe/crash-report :p :killed))
+    (assert= nil (observe/crash-report :p :shutdown))
+    (assert= nil (observe/crash-report :p [:shutdown :because])))
+  (test "an arbitrary thrown value is reported by its printed form"
+    (assert= "[:custom :reason]"
+      (get (observe/crash-report :p [:error [:custom :reason]]) :message))))
+
+(describe "the other hatch events"
+  (test "a live view hook that raised"
+    (let (r (observe/live-error {:phase :mount :key "chat" :error "chat/mount: no room"}))
+      (assert= "live" (get r :namespace))
+      (assert= "live :mount chat" (get r :action))
+      (assert= "chat/mount" (get r :name))))
+  (test "a channel callback that raised"
+    (let (r (observe/channel-error {:phase :join :topic "room:1" :error "boom"}))
+      (assert= "channel" (get r :namespace))
+      (assert= "channel :join room:1" (get r :action))))
+  (test "a rate-limited request is a count by method and path, never by key"
+    (let (m (observe/ratelimit-denied {:key "1.2.3.4" :method "POST" :path "/api/v1/publish"}))
+      (assert= "ratelimit_denied" (get m :name))
+      (assert= :counter (get m :kind))
+      (assert= {:method "POST" :path "/api/v1/publish"} (get m :tags)))))
+
+(describe "store events"
+  (test "a query stop is a timing by statement kind and table"
+    (let (m (observe/query-timing {:duration 1.25}
+              {:op "SELECT" :source "packages" :sql "SELECT …"}))
+      (assert= "query_duration" (get m :name))
+      (assert= 1.25 (get m :value))
+      (assert= {:op "SELECT" :source "packages"} (get m :tags))))
+  (test "a failed query carries the SQL as a param and not the parameters"
+    (let (r (observe/query-error {:op "INSERT"
+                                  :source "releases"
+                                  :sql "INSERT INTO releases …"
+                                  :error "pg: duplicate key"}))
+      (assert= "store" (get r :namespace))
+      (assert= "INSERT releases" (get r :action))
+      (assert= "pg" (get r :name))
+      (assert= {:sql "INSERT INTO releases …"} (get r :params)))))
+
+(describe "attach-all"
+  :isolated (test "hatch, store and crash handlers are all installed and all removed"
+    (let (provider (fresh))
+      (observe/attach-all)
+      (telemetry/emit [:store :query :stop] {:duration 2} {:op "SELECT" :source "t"})
+      (telemetry/emit [:hatch :ratelimit :denied] {} {:method "GET" :path "/"})
+      (telemetry/emit [:hatch :live :exception] {} {:phase :mount :key "k" :error "x"})
+      (telemetry/sync)
+      (observe/flush-sync)
+      (assert= 2 (count (entries provider :metrics)))
+      (assert= 1 (count (entries provider :errors)))
+      (observe/detach-hatch)
+      (observe/detach-store)
+      (observe/detach-crashes)
+      (assert= nil (get (telemetry/handlers) [:store :query :stop]))
+      (assert= nil (get (telemetry/handlers) [:hatch :ratelimit :denied]))
+      (observe/stop))))
+
+(describe "fan-out"
+  :isolated (test "every provider receives every batch, and one failing does not stop the others"
+    (let (a (observe/memory-provider)
+          b (observe/memory-provider {:fail? true})
+          c (observe/memory-provider))
+      (observe/start {:provider (observe/fan-out-provider [a b c]) :flush-ms 60000})
+      (observe/gauge "x" 1)
+      (observe/flush-sync)
+      (assert= 1 (count (entries a :metrics)))
+      (assert= 1 (count (entries c :metrics)))
+      ;; the batch counts as failed (b refused), which is what the shipper logs
+      (assert= 1 (get (observe/stats) :failed))
       (observe/stop))))

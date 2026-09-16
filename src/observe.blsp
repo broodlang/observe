@@ -297,23 +297,32 @@
 
 ;; ---- errors -----------------------------------------------------------------------
 
+(defn- name-from-message (message)
+  "Brood's `fn-name: what went wrong` convention: the `fn-name`, when the text before the
+  first colon looks like one (short, no spaces); else `error`."
+  (let (i (index-of message ": "))
+    (if (and (> i 0) (< i 40) (< (index-of (string/substring message 0 i) " ") 0))
+      (string/substring message 0 i)
+      "error")))
+
 (defn error-name (e)
-  "A grouping name for a caught error. A runtime fault carries a `:code`; a raised string
-  in Brood's `fn-name: what went wrong` convention groups by its `fn-name`; anything else
-  is `error`."
+  "A grouping name for a caught error. A runtime fault carries a `:code` (`E0030`); a
+  raised string, or a user fault whose message is one, groups by its `fn-name:` prefix;
+  anything else is `error`."
   (cond
     (and (map? e) (get e :code)) (str (get e :code))
-    (string? e)
-      (let (i (index-of e ": "))
-        (if (and (> i 0) (< i 40) (< (index-of (string/substring e 0 i) " ") 0))
-          (string/substring e 0 i)
-          "error"))
+    (map? e) (name-from-message (str (get e :message "")))
+    (string? e) (name-from-message e)
     :else "error"))
 
 (defn error-backtrace (e)
-  "The frames of a caught error as strings, oldest last — `[]` for a raised string."
+  "The frames of a caught error as strings, innermost first — the raise site (when the
+  fault carries a position) and then the trace. `[]` for a raised string."
   (if (map? e)
-    (vec (map (or (get e :trace) []) (fn (frame) (str (get frame :fn "?")))))
+    (let (site (when (get e :line)
+                 (str (or (get e :file) "<source>") ":" (get e :line) ":" (get e :col 0)))
+          frames (map (or (get e :trace) []) (fn (frame) (str (get frame :fn "?")))))
+      (vec (if site (cons site frames) frames)))
     []))
 
 (defn error-report (e meta)
@@ -336,6 +345,69 @@
   (string-valued maps). Returns nil."
   (submit :errors (error-report e meta)))
 
+;; ---- process crashes -------------------------------------------------------------------
+;;
+;; A request handler that raises is caught by hatch and reported through `attach-hatch`.
+;; Every OTHER process — a worker `spawn`ed from a handler, a gen server, a task whose
+;; owner moved on — just dies, and brood's default crash reporter prints it to stderr,
+;; which in production is a log line nobody is paging on. The kernel's system monitor
+;; pushes `[:system :exit pid reason]` for each abnormal exit, and several subscribers
+;; may sit on it at once (ADR-305), so this is a second subscriber next to the default
+;; reporter: the same crash prints locally AND becomes an error report.
+
+(def *crash-interval-ms* 60000)
+
+(defn- crash? (reason)
+  "Reasons that are not faults — the ones brood's crash reporter also ignores."
+  (not (or (= reason :normal)
+         (= reason :killed)
+         (= reason :shutdown)
+         (and (vector? reason) (= (first reason) :shutdown)))))
+
+(defn crash-report (pid reason)
+  "The report for a process exit, or nil when the exit is not a crash. The kernel wraps a
+  raise as `[:error fault]`; the fault is what is reported, with the pid as a tag."
+  (when (crash? reason)
+    (let (fault (if (and (vector? reason) (= (first reason) :error)) (second reason) reason))
+      (error-report (if (or (map? fault) (string? fault)) fault (pr-str fault))
+        {:action "process"
+         :namespace "process"
+         :tags {:pid (str pid)}}))))
+
+(defn- crash-site (report)
+  (str (get report :name) ": " (get report :message)))
+
+(defn- crash-loop (seen)
+  "`seen` is site → when it was last reported: a supervised worker in a restart loop is
+  one report a minute, not one per restart."
+  (receive
+    ([:system :exit pid reason] (let (report (crash-report pid reason)
+                                      site (when report (crash-site report))
+                                      last (when site (get seen site))
+                                      now (os/now))
+                                  (if (and report
+                                        (or (nil? last) (> (- now last) *crash-interval-ms*)))
+                                    (do (submit :errors report) (crash-loop (assoc seen site now)))
+                                    (crash-loop seen))))
+    (:stop (do (proc/system-monitor nil) nil))
+    (_ (crash-loop seen))))
+
+(defn attach-crashes ()
+  "Report every abnormal process exit in this runtime as an error, next to brood's own
+  crash reporter (which keeps printing to stderr). Idempotent; returns the listener pid.
+  A crash site repeats at most once per `*crash-interval-ms*`."
+  (or (proc/whereis :observe-crashes)
+    (let (listener (spawn (crash-loop {})))
+      (proc/register :observe-crashes listener)
+      (proc/system-monitor listener {:exit-abnormal true})
+      listener)))
+
+(defn detach-crashes ()
+  "Stop reporting process exits. Returns nil."
+  (let (listener (proc/whereis :observe-crashes))
+    (when listener (send listener :stop)))
+  nil)
+
 ;; ---- hatch --------------------------------------------------------------------------
 
 (defn request-timing (measurements metadata)
@@ -356,27 +428,135 @@
      :namespace "web"
      :tags {:method (str (get metadata :method "?")) :path (str (get metadata :path "?"))}}))
 
-(defn attach-hatch (&optional (opts {}))
-  "Attach to the events hatch's `http/server` emits: every handled request becomes a
-  `request_duration` timing, every crashed handler an error report. Starts the telemetry
-  listener if it is not running. `opts` `:id` (default `:observe-hatch`) names the
-  handlers for `detach-hatch`."
+(defn live-error (metadata)
+  "The report for one `[:hatch :live :exception]` event — a live view hook that raised."
+  (error-report (get metadata :error "live view raised")
+    {:action (str "live " (get metadata :phase "?") " " (get metadata :key "?"))
+     :namespace "live"
+     :tags {:phase (str (get metadata :phase "?")) :key (str (get metadata :key "?"))}}))
+
+(defn channel-error (metadata)
+  "The report for one `[:hatch :channel :exception]` event — a channel callback that raised."
+  (error-report (get metadata :error "channel raised")
+    {:action (str "channel " (get metadata :phase "?") " " (get metadata :topic "?"))
+     :namespace "channel"
+     :tags {:phase (str (get metadata :phase "?")) :topic (str (get metadata :topic "?"))}}))
+
+(defn ratelimit-denied (metadata)
+  "The metric for one `[:hatch :ratelimit :denied]` event: a `ratelimit_denied` count by
+  method and path. Not by key — a key is a client, and a tag set the clients choose is
+  unbounded."
+  {:ts (os/now)
+   :name "ratelimit_denied"
+   :kind :counter
+   :value 1
+   :tags {:method (str (get metadata :method "?")) :path (str (get metadata :path "?"))}})
+
+;; The events hatch emits and what each becomes — the table `attach-hatch` installs.
+(def *hatch-events*
+  [[:stop
+     [:hatch :request :stop]
+     :metrics (fn (measurements metadata) (request-timing measurements metadata))]
+    [:exception [:hatch :request :exception] :errors (fn (_ metadata) (request-error metadata))]
+    [:live [:hatch :live :exception] :errors (fn (_ metadata) (live-error metadata))]
+    [:channel [:hatch :channel :exception] :errors (fn (_ metadata) (channel-error metadata))]
+    [:denied [:hatch :ratelimit :denied] :metrics (fn (_ metadata) (ratelimit-denied metadata))]])
+
+(defn- attach-table (id table)
   (when (nil? (telemetry/pid)) (telemetry/start))
-  (let (id (get opts :id :observe-hatch))
-    (telemetry/attach [id :stop]
-      [:hatch :request :stop]
-      (fn (_ measurements metadata) (submit :metrics (request-timing measurements metadata))))
-    (telemetry/attach [id :exception]
-      [:hatch :request :exception]
-      (fn (_ _ metadata) (submit :errors (request-error metadata))))
-    id))
+  (dolist (row table)
+    (let ([suffix event kind build] row)
+      (telemetry/attach [id suffix]
+        event
+        (fn (_ measurements metadata) (submit kind (build measurements metadata))))))
+  id)
+
+(defn- detach-table (id table)
+  (dolist (row table) (telemetry/detach [id (first row)]))
+  nil)
+
+(defn attach-hatch (&optional (opts {}))
+  "Attach to everything hatch emits: each handled request a `request_duration` timing,
+  each crashed handler, live view hook or channel callback an error report, each
+  rate-limited request a `ratelimit_denied` count. Starts the telemetry listener if it is
+  not running. `opts` `:id` (default `:observe-hatch`) names the handlers for
+  `detach-hatch`."
+  (attach-table (get opts :id :observe-hatch) *hatch-events*))
 
 (defn detach-hatch (&optional (opts {}))
   "Remove the handlers `attach-hatch` installed."
-  (let (id (get opts :id :observe-hatch))
-    (telemetry/detach [id :stop])
-    (telemetry/detach [id :exception])
-    nil))
+  (detach-table (get opts :id :observe-hatch) *hatch-events*))
+
+;; ---- store ------------------------------------------------------------------------------
+
+(defn query-timing (measurements metadata)
+  "The metric for one `[:store :query :stop]` event: `query_duration` tagged by the
+  statement kind and the table — never by the SQL, which is unbounded."
+  {:ts (os/now)
+   :name "query_duration"
+   :kind :timing
+   :value (get measurements :duration 0)
+   :tags {:op (str (get metadata :op "?")) :source (str (get metadata :source "?"))}})
+
+(defn query-error (metadata)
+  "The report for one `[:store :query :exception]` event. The SQL rides as a param —
+  the parameters do not, they are the data."
+  (error-report (get metadata :error "query raised")
+    {:action (str (get metadata :op "?") " " (get metadata :source "?"))
+     :namespace "store"
+     :tags {:op (str (get metadata :op "?")) :source (str (get metadata :source "?"))}
+     :params {:sql (str (get metadata :sql ""))}}))
+
+(def *store-events*
+  [[:stop
+     [:store :query :stop]
+     :metrics (fn (measurements metadata) (query-timing measurements metadata))]
+    [:exception [:store :query :exception] :errors (fn (_ metadata) (query-error metadata))]])
+
+(defn attach-store (&optional (opts {}))
+  "Attach to the events `store`'s repo emits: every query a `query_duration` timing by
+  statement kind and table, every failed one an error report. `opts` `:id` (default
+  `:observe-store`)."
+  (attach-table (get opts :id :observe-store) *store-events*))
+
+(defn detach-store (&optional (opts {}))
+  "Remove the handlers `attach-store` installed."
+  (detach-table (get opts :id :observe-store) *store-events*))
+
+(defn attach-all ()
+  "`attach-hatch`, `attach-store` and `attach-crashes` — everything a hatch app on store
+  can pick up without writing a line of instrumentation."
+  (attach-hatch)
+  (attach-store)
+  (attach-crashes)
+  nil)
+
+;; ---- several providers at once ----------------------------------------------------------
+
+(defrecord fan-out (providers))
+
+(defn- each-provider (providers ship)
+  "Run `ship` for every provider; the first failure is the result, the rest still run —
+  a vendor being down must not stop a local copy being kept."
+  (fold providers
+    :ok (fn (outcome p)
+      (let (result (try (ship p) (catch e [:error (error-message e)])))
+        (if (= outcome :ok) (if (= result :ok) :ok result) outcome)))))
+
+(impl Provider
+  fan-out
+  (ship-logs [f context records]
+    (each-provider (get f :providers) (fn (p) (ship-logs p context records))))
+  (ship-metrics [f context metrics]
+    (each-provider (get f :providers) (fn (p) (ship-metrics p context metrics))))
+  (ship-errors [f context reports]
+    (each-provider (get f :providers) (fn (p) (ship-errors p context reports)))))
+
+(defn fan-out-provider (providers)
+  "A provider that hands every batch to each of `providers` in turn — a local copy next to
+  the vendor, or two vendors while migrating. A batch counts as shipped when every provider
+  took it; the first failure is what the shipper logs."
+  (fan-out (vec providers)))
 
 ;; ---- a provider for tests -----------------------------------------------------------
 
