@@ -1,0 +1,9 @@
+# Brood package cache — regenerable from project.lock.blsp (which is committed)
+_deps/
+
+# Startup-image cache — a build artifact, rebuilt on demand
+.brood/
+
+# Editor / OS cruft
+*.swp
+.DS_Store

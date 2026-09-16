@@ -1,0 +1,225 @@
+;; The shipper against the memory provider: batching, the bound, failure accounting, the
+;; log backend and the hatch handlers. No network anywhere — a provider is a value.
+;;
+;; The shipper is one registered process, so every group that starts one is `:isolated` —
+;; two such tests in parallel would each stop the other's shipper mid-flight.
+(defmodule observe-test
+  (:use test)
+  (:alias observe)
+  (:alias gen)
+  (:alias log)
+  (:alias telemetry))
+
+(defn- fresh (&optional (opts {}))
+  "A shipper over a new memory provider with a long tick, so a test controls every flush."
+  (let (provider (observe/memory-provider opts))
+    (observe/start (merge {:provider provider :flush-ms 60000 :env "test" :app "observe"} opts))
+    provider))
+
+(defn- batches (provider kind)
+  (seq/filter (observe/shipped provider) (fn (entry) (= (first entry) kind))))
+
+(defn- entries (provider kind)
+  (apply append (map (batches provider kind) (fn (entry) (nth entry 2)))))
+
+(describe "shipping"
+  :isolated (test "a metric reaches the provider on flush, with the context"
+    (let (provider (fresh))
+      (observe/gauge "queue_depth" 7 {:queue "mail"})
+      (is (observe/flush-sync))
+      (let ([kind context batch] (first (observe/shipped provider)))
+        (assert= :metrics kind)
+        (assert= "test" (get context :env))
+        (assert= "observe" (get context :app))
+        (is (string? (get context :hostname)))
+        (assert= [{:name "queue_depth" :kind :gauge :value 7 :tags {:queue "mail"}}] batch))
+      (observe/stop)))
+
+  (test "counter defaults to one, timing carries the sample"
+    (let (provider (fresh))
+      (observe/counter "hits")
+      (observe/counter "hits" 3)
+      (observe/timing "render" 12.5)
+      (observe/flush-sync)
+      (assert= [1 3 12.5] (vec (map (entries provider :metrics) (fn (m) (get m :value)))))
+      (assert= [:counter :counter :timing]
+        (vec (map (entries provider :metrics) (fn (m) (get m :kind)))))
+      (observe/stop)))
+
+  (test "a full batch goes out without waiting for the tick"
+    (let (provider (fresh {:max-batch 3}))
+      (for (i (range 0 7)) (observe/counter "n" i))
+      ;; two full batches left on their own; the seventh entry waits for a flush
+      (observe/flush-sync)
+      (assert= 3 (count (batches provider :metrics)))
+      (assert= [3 3 1] (vec (map (batches provider :metrics) (fn (entry) (count (nth entry 2))))))
+      (assert= 7 (get (observe/stats) :shipped))
+      (observe/stop)))
+
+  (test "nothing is shipped when nothing was recorded"
+    (let (provider (fresh))
+      (is (observe/flush-sync))
+      (assert= [] (vec (observe/shipped provider)))
+      (observe/stop)))
+
+  (test "entries recorded with no shipper running are dropped quietly"
+    (observe/stop)
+    (assert= nil (observe/gauge "x" 1))
+    (assert= nil (observe/report "boom"))
+    (assert= nil (observe/stats))))
+
+(describe "the bound"
+  :isolated (test "past max-buffer the oldest half is dropped and counted"
+    (let (provider (fresh {:max-buffer 10 :max-batch 1000}))
+      (for (i (range 0 12)) (observe/counter "n" i))
+      (let (stats (observe/stats))
+        ;; 10 buffered, the 11th trims to the newest 5 then appends: 6, +1 = 7
+        (assert= 7 (get (get stats :pending) :metrics))
+        (assert= 5 (get stats :dropped)))
+      (observe/flush-sync)
+      (assert= [5 6 7 8 9 10 11] (vec (map (entries provider :metrics) (fn (m) (get m :value)))))
+      (observe/stop))))
+
+(describe "failure"
+  :isolated (test "a refusing provider is counted, and the entries are not retried"
+    (let (provider (fresh {:fail? true}))
+      (observe/gauge "x" 1)
+      (observe/gauge "y" 2)
+      (observe/flush-sync)
+      (let (stats (observe/stats))
+        (assert= 2 (get stats :failed))
+        (assert= 0 (get stats :shipped))
+        (assert= 0 (get (get stats :pending) :metrics)))
+      (observe/stop)))
+
+  (test "a provider that raises is a failure, not a dead shipper"
+    (let (provider (fresh {:fail? true}))
+      (observe/report "boom")
+      (observe/flush-sync)
+      (assert= 1 (get (observe/stats) :failed))
+      ;; still answering
+      (observe/gauge "x" 1)
+      (assert= 1 (get (get (observe/stats) :pending) :metrics))
+      (observe/stop))))
+
+(describe "log-backend"
+  :isolated (test "ships a record above its level with the structured meta"
+    (let (provider (fresh)
+          backend (observe/log-backend {:min-level :warn}))
+      (log/backend-emit backend {:level :info :msg "quiet" :meta {} :ts 1})
+      (log/backend-emit backend {:level :error :msg "loud" :meta {:path "/x"} :ts 2})
+      (observe/flush-sync)
+      (assert= [{:ts 2 :level :error :message "loud" :meta {:path "/x"}}]
+        (vec (entries provider :logs)))
+      (observe/stop)))
+
+  (test "never ships the shipper's own warnings"
+    (let (provider (fresh)
+          backend (observe/log-backend {:min-level :debug}))
+      (log/backend-emit backend
+        {:level :warn :msg "observe: shipping failed" :meta {:observe true} :ts 1})
+      (observe/flush-sync)
+      (assert= [] (vec (observe/shipped provider)))
+      (observe/stop)))
+
+  (test "through a real logger"
+    (let (provider (fresh))
+      (log/start-logger {:level :debug :backends [(observe/log-backend {:min-level :info})]})
+      (log/info "hello" {:n 1})
+      (log/debug "too quiet")
+      ;; a query answers only after the casts before it were handled — the record has
+      ;; reached the shipper once this returns
+      (gen/call (log/logger) :config)
+      (log/stop-logger)
+      (observe/flush-sync)
+      (assert= ["hello"] (vec (map (entries provider :logs) (fn (e) (get e :message)))))
+      (observe/stop))))
+
+(describe "error reports"
+  (test "a raised string groups by its fn-name prefix"
+    (let (report (observe/error-report "registry/publish: version taken: 1.0.0" {:action "publish"}))
+      (assert= "registry/publish" (get report :name))
+      (assert= "registry/publish: version taken: 1.0.0" (get report :message))
+      (assert= [] (get report :backtrace))
+      (assert= "publish" (get report :action))
+      (assert= "app" (get report :namespace))))
+
+  (test "a string with no prefix is just an error"
+    (assert= "error" (observe/error-name "something broke"))
+    (assert= "error" (observe/error-name "a sentence with spaces: then a colon")))
+
+  (test "a runtime fault carries its code and frames"
+    (let (fault (try (+ 1 "x") (catch e e))
+          report (observe/error-report fault {}))
+      (assert= "E0030" (get report :name))
+      (is (includes? (get report :message) "expected number"))
+      (is (vector? (get report :backtrace)))))
+
+  (test "report reaches the provider"
+    :isolated (let (provider (fresh))
+      (observe/report "boom: 1" {:tags {:job "x"}})
+      (observe/flush-sync)
+      (let (report (first (entries provider :errors)))
+        (assert= "boom" (get report :name))
+        (assert= {:job "x"} (get report :tags))
+        (is (int? (get report :ts))))
+      (observe/stop))))
+
+(describe "hatch"
+  :isolated (test "a request stop is a timing tagged by route, method and status"
+    (assert= {:name "request_duration"
+              :kind :timing
+              :value 12
+              :tags {:route "/packages/:name" :method "GET" :status "200"}}
+      (observe/request-timing {:duration 12}
+        {:method "GET" :path "/packages/x" :status 200 :route "/packages/:name"})))
+
+  (test "without a route the path stands in"
+    (assert= "/health"
+      (get (get (observe/request-timing {:duration 1} {:method "GET" :path "/health" :status 200})
+             :tags)
+        :route)))
+
+  (test "a crashed handler is a web-namespace report named for the request"
+    (let (report (observe/request-error {:method "POST"
+                                         :path "/api/v1/publish"
+                                         :error "db/insert: down"}))
+      (assert= "web" (get report :namespace))
+      (assert= "POST /api/v1/publish" (get report :action))
+      (assert= "db/insert" (get report :name))))
+
+  (test "attached handlers turn the events into entries"
+    (let (provider (fresh))
+      (observe/attach-hatch)
+      (telemetry/emit [:hatch :request :stop]
+        {:duration 3}
+        {:method "GET" :path "/" :status 200 :route "/"})
+      (telemetry/emit [:hatch :request :exception]
+        {}
+        {:method "GET" :path "/boom" :error "boom: x"})
+      (telemetry/sync)
+      (observe/flush-sync)
+      (assert= 1 (count (entries provider :metrics)))
+      (assert= 1 (count (entries provider :errors)))
+      (observe/detach-hatch)
+      (assert= nil (get (telemetry/handlers) [:hatch :request :stop]))
+      (observe/stop))))
+
+(describe "the failure streak"
+  :isolated (test "a provider that keeps failing is warned about once, until it recovers"
+    (let (me (self)
+          provider (fresh {:fail? true}))
+      (log/start-logger {:level :debug
+                         :backends [(log/fn-backend (fn (line) (send me [:line line])))]})
+      (observe/gauge "x" 1)
+      (observe/flush-sync)
+      (observe/gauge "x" 2)
+      (observe/flush-sync)
+      (observe/gauge "x" 3)
+      (observe/flush-sync)
+      (gen/call (log/logger) :config)
+      (log/stop-logger)
+      (letrec (drain (fn (n) (receive ([:line _] (drain (+ n 1))) (after 50 n))))
+        (assert= 1 (drain 0)))
+      (assert= 3 (get (observe/stats) :failed))
+      (observe/stop))))

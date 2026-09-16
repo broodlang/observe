@@ -1,0 +1,9 @@
+;; observe — ship logs, metrics and errors to a monitoring provider. Vendor-neutral: a
+;; provider is any value with a `Provider` impl (observe-appsignal is the first).
+(project
+  :name "observe"
+  :version "0.1.0"
+  :brood ">= 0.29.2"
+  :description
+    "Ship logs, metrics and errors to a monitoring provider — batched, bounded, off the request path. Vendor-neutral; pair with a provider package such as observe-appsignal."
+  :repository "https://github.com/broodlang/observe")

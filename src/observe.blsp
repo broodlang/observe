@@ -1,0 +1,406 @@
+;; observe — ship logs, metrics and errors to a monitoring provider.
+;;
+;; Brood already has the two seams every monitoring integration hangs off: `log` (a logger
+;; whose backends are any value with a `LogBackend` impl) and `telemetry` (Erlang-style
+;; events with handlers in an isolated listener). What neither has is the part that gets
+;; a record OUT of the process: batching, the outbound HTTP, a bound on memory when the
+;; network is down, and one place a vendor plugs in. This package is that part. It knows
+;; nothing about any vendor; a provider package (observe-appsignal, …) implements the
+;; `Provider` ability and this does the rest.
+;;
+;; Design notes (the *why*; the *what* is in the docstrings):
+;;  - **One shipper process, and every entry point is a cast into it.** A log line, a
+;;    metric or an error report costs the caller one `send`, whatever the network is
+;;    doing. A request handler must never wait on a monitoring vendor.
+;;  - **The HTTP happens in a throwaway worker, never in the shipper.** The shipper keeps
+;;    accepting casts while a batch is in flight, at most one flight per kind. A slow
+;;    endpoint therefore slows nothing but its own batch.
+;;  - **Buffers are bounded, and the bound drops the OLDEST.** When a provider is down
+;;    the recent entries are the ones worth keeping — they say what is happening now.
+;;    Dropping is by halves (keep the newest `max-buffer`/2) so a sustained overflow costs
+;;    one O(n) trim per n/2 inserts rather than one per insert; the count of what was
+;;    dropped is in `stats`, which is the honest thing a monitoring library can do about
+;;    its own losses.
+;;  - **Failures are logged, not raised, and not on every batch.** A vendor outage is
+;;    an ordinary condition; the first failure of a streak logs a warning through the
+;;    same `log` the shipper may itself be a backend of — which is why `ship-*` results
+;;    are never turned back into log entries for the shipper (`backend-passes?` would
+;;    accept them and the loop would feed itself).
+(defmodule observe
+  "Ship logs, metrics and errors to a monitoring provider, without ever slowing the
+  code that produced them.
+
+      (observe/start {:provider (observe-appsignal/provider {…})
+                      :env \"prod\" :revision \"abc123\"})
+      (log/add-backend (observe/log-backend {:min-level :info}))   ; every log line
+      (observe/attach-hatch)              ; request timings + crashed handlers
+      (observe/report caught-error {:action \"nightly-sync\"})      ; a caught error
+      (observe/gauge \"queue_depth\" 42 {:queue \"mail\"})
+
+  A provider is any value with a `Provider` impl: three ops, each handed a batch and the
+  run's `context` (`:hostname`, `:env`, `:revision`, `:app`), returning `:ok` or
+  `[:error message]`. `memory-provider` is the one for tests and for writing a new one."
+  (:alias gen)
+  (:alias math)
+  ; whereis / register — the shipper is addressed by name so callers never hold a pid
+  (:alias proc)
+  ; the ability an `impl` names must be visible bare — a qualified `log/LogBackend` there
+  ; registers under a name the logger never dispatches on
+  (:use log :only [LogBackend])
+  (:alias log)
+  (:alias telemetry)
+  (:alias timer)
+  (:alias os)
+  (:alias seq)
+  (:alias string))
+
+;; ---- the Provider ability -------------------------------------------------------
+
+(defability Provider
+  "How a vendor receives a batch. Each op is called in a worker process with the batch and
+  the run's `context` map, and returns `:ok` or `[:error message]`. A raise is caught and
+  treated as `[:error message]`, so an implementation may simply let `http/request`'s
+  failures surface.
+
+  - `ship-logs`: `records` is a vector of `{:ts <epoch ms> :level :info :message \"…\"
+    :meta {…}}`.
+  - `ship-metrics`: `metrics` is a vector of `{:name \"…\" :kind :gauge|:counter|:timing
+    :value <number> :tags {…}}`.
+  - `ship-errors`: `reports` is a vector of `{:ts :name :message :backtrace [\"…\"]
+    :action :namespace :tags {…} :params {…}}`."
+  (ship-logs [self context records] :-> any)
+  (ship-metrics [self context metrics] :-> any)
+  (ship-errors [self context reports] :-> any))
+
+;; ---- the shipper ------------------------------------------------------------------
+
+(def *default-flush-ms* 5000)
+(def *default-max-batch* 100)
+(def *default-max-buffer* 1000)
+
+(def- kinds [:logs :metrics :errors])
+
+(defn- ship (provider context kind batch)
+  "Hand `batch` to the provider op for `kind`. Runs in the worker."
+  (case kind
+    :logs (ship-logs provider context batch)
+    :metrics (ship-metrics provider context batch)
+    :errors (ship-errors provider context batch)))
+
+(defn- ship-result (provider context kind batch)
+  "`ship`, with a raise folded into the `[:error message]` shape."
+  (let (result (try (ship provider context kind batch) (catch e [:error (error-message e)])))
+    (if (= result :ok) :ok result)))
+
+(defn- start-flight (state kind)
+  "Take up to `max-batch` of `kind`'s buffer and ship it in a worker. The remainder stays
+  buffered for the next flush; the worker reports back as `[:flushed kind count result]`."
+  (let (buffer (get state kind)
+        batch (take buffer (get state :max-batch))
+        remainder (vec (drop buffer (get state :max-batch)))
+        shipper (self)
+        provider (get state :provider)
+        context (get state :context))
+    (spawn (send shipper
+             [:flushed kind (count batch) (ship-result provider context kind (vec batch))]))
+    (assoc state kind remainder :in-flight (conj (get state :in-flight) kind))))
+
+(defn- flushable? (state kind)
+  (and (not (empty? (get state kind))) (not (contains? (get state :in-flight) kind))))
+
+(defn- flush-kind (state kind)
+  (if (flushable? state kind) (start-flight state kind) state))
+
+(defn- flush-all (state)
+  (fold kinds state flush-kind))
+
+(defn- buffer-entry (state kind entry)
+  "Append `entry` to `kind`'s buffer, trimming to the newest half past `max-buffer`, and
+  flush at once when a batch is ready. The flush happens on the batch boundary rather
+  than only on the timer so a burst leaves promptly and the buffer never holds more than
+  a batch longer than it must."
+  (let (buffer (get state kind)
+        limit (get state :max-buffer)
+        trimmed (if (>= (count buffer) limit)
+                  (vec (seq/take-last buffer (math/max 1 (math/quot limit 2))))
+                  buffer)
+        dropped (- (count buffer) (count trimmed))
+        next (assoc state
+               kind (conj trimmed entry)
+               :dropped (+ (get state :dropped) dropped)))
+    (if (>= (count (get next kind)) (get next :max-batch)) (flush-kind next kind) next)))
+
+(defn- note-result (state kind shipped result)
+  "Record a flight's outcome. The first failure of a streak is logged; the rest are counted."
+  (if (= result :ok)
+    (assoc state :shipped (+ (get state :shipped) shipped) :failing #{})
+    (let (failing (get state :failing)
+          message (if (vector? result) (second result) (pr-str result)))
+      (when (not (contains? failing kind))
+        (log/warn (str "observe: shipping " (pr-str kind) " failed: " message)
+          {:observe true :kind kind :count shipped}))
+      (assoc state
+        :failed (+ (get state :failed) shipped)
+        :failing (conj failing kind)))))
+
+(gen/defserver shipper
+  (state)
+  "The shipper: buffers per kind, one flight per kind, a timer tick to flush the rest."
+  (cast [:entry kind entry] (buffer-entry state kind entry))
+  (cast :flush (flush-all state))
+  (info :tick (flush-all state))
+  (info [:flushed kind shipped result]
+    (let (landed (assoc (note-result state kind shipped result)
+                   :in-flight (disj (get state :in-flight) kind)))
+      ;; More than a batch arrived while this one was out: keep going rather than
+      ;; wait a whole tick.
+      (if (>= (count (get landed kind)) (get landed :max-batch)) (flush-kind landed kind) landed)))
+  (query :stats
+    {:pending {:logs (count (get state :logs))
+               :metrics (count (get state :metrics))
+               :errors (count (get state :errors))}
+     :in-flight (get state :in-flight)
+     :shipped (get state :shipped)
+     :failed (get state :failed)
+     :dropped (get state :dropped)})
+  (query :context (get state :context)))
+
+(defn context (opts)
+  "The run's context map from `opts`: `:hostname` (default this machine's), `:env`,
+  `:revision`, `:app`. Sent with every batch; a provider maps it onto its own fields."
+  {:hostname (or (get opts :hostname) (os/hostname))
+   :env (get opts :env)
+   :revision (get opts :revision)
+   :app (get opts :app)})
+
+(defn start (opts)
+  "Start the shipper, registered as `:observe`, and return its pid. `opts`:
+
+  - `:provider` — a value with a `Provider` impl (required).
+  - `:env`, `:revision`, `:app`, `:hostname` — the context, see `context`.
+  - `:flush-ms` (default 5000) — how often buffered entries go out.
+  - `:max-batch` (default 100) — entries per request; a full batch goes out at once.
+  - `:max-buffer` (default 1000) — entries held per kind while the provider is
+    unreachable; past it the oldest half is dropped and counted in `stats`.
+
+  Replaces a running shipper. Nothing here contacts the provider: the first request is
+  the first flush."
+  (when (nil? (get opts :provider)) (error "observe/start: a :provider is required"))
+  (stop)
+  (let (flush-ms (get opts :flush-ms *default-flush-ms*)
+        pid (gen/start shipper
+              {:provider (get opts :provider)
+               :context (context opts)
+               :max-batch (get opts :max-batch *default-max-batch*)
+               :max-buffer (get opts :max-buffer *default-max-buffer*)
+               :logs []
+               :metrics []
+               :errors []
+               :in-flight #{}
+               :failing #{}
+               :shipped 0
+               :failed 0
+               :dropped 0}))
+    (proc/register :observe pid)
+    (timer/send-interval flush-ms pid :tick)
+    pid))
+
+(defn pid ()
+  "The running shipper's pid, or nil."
+  (proc/whereis :observe))
+
+(defn stop ()
+  "Stop the shipper, if one is running. Buffered entries are discarded — `flush-sync`
+  first to get them out. Returns nil."
+  (let (p (pid))
+    (when p (gen/stop p)))
+  nil)
+
+(defn stats ()
+  "What the shipper has done: `{:pending {:logs :metrics :errors} :in-flight :shipped
+  :failed :dropped}` (counts of entries), or nil with no shipper running."
+  (let (p (pid))
+    (when p (gen/call p :stats))))
+
+(defn flush ()
+  "Ask the shipper to send everything buffered now (a cast). Returns nil."
+  (let (p (pid))
+    (when p (gen/cast p :flush)))
+  nil)
+
+(defn flush-sync (&optional (timeout-ms 5000))
+  "`flush`, then wait until nothing is pending or in flight — for a shutdown, or a test.
+  Returns true when drained, false on the deadline."
+  (flush)
+  (letrec (wait (fn (deadline)
+                  (let (s (stats))
+                    (cond
+                      (nil? s) true
+                      (and (empty? (get s :in-flight))
+                        (= 0
+                          (+ (get (get s :pending) :logs)
+                            (get (get s :pending) :metrics)
+                            (get (get s :pending) :errors))))
+                        true
+                      (> (os/now) deadline) false
+                      :else (do (sleep 10) (flush) (wait deadline))))))
+    (wait (+ (os/now) timeout-ms))))
+
+(defn- submit (kind entry)
+  (let (p (pid))
+    (when p (gen/cast p [:entry kind entry])))
+  nil)
+
+;; ---- logs -------------------------------------------------------------------------
+
+(defn log-entry (record)
+  "A `log` record as the entry a provider receives: `{:ts :level :message :meta}`."
+  {:ts (get record :ts)
+   :level (get record :level)
+   :message (get record :msg)
+   :meta (or (get record :meta) {})})
+
+(defrecord backend (min-level filter))
+
+;; The `LogBackend` impl: gate the record the way every other backend does, then one cast.
+;; `backend-emit` runs in the logger process, so the gate is the only work done there.
+(impl LogBackend
+  backend
+  (backend-emit [b record]
+    (when (and (log/backend-passes? b record)
+            ;; never re-ship the shipper's own warnings — see the header
+            (not (get (or (get record :meta) {}) :observe)))
+      (submit :logs (log-entry record)))
+    nil))
+
+(defn log-backend (&optional (opts {}))
+  "A `log` backend that ships every record to the provider. `opts`: `:min-level` (default
+  `:info`) and `:filter`, as for `log/backend`. Add it with `(log/add-backend …)`."
+  (backend (get opts :min-level :info) (get opts :filter)))
+
+;; ---- metrics ----------------------------------------------------------------------
+
+(defn- metric (name kind value tags)
+  (submit :metrics {:name name :kind kind :value value :tags (or tags {})}))
+
+(defn gauge (name value &optional tags)
+  "Record `value` as the current level of `name` (a queue depth, a pool size)."
+  (metric name :gauge value tags))
+
+(defn counter (name &optional (value 1) tags)
+  "Add `value` (default 1) to `name`."
+  (metric name :counter value tags))
+
+(defn timing (name ms &optional tags)
+  "Record `ms` as one duration sample for `name`."
+  (metric name :timing ms tags))
+
+;; ---- errors -----------------------------------------------------------------------
+
+(defn error-name (e)
+  "A grouping name for a caught error. A runtime fault carries a `:code`; a raised string
+  in Brood's `fn-name: what went wrong` convention groups by its `fn-name`; anything else
+  is `error`."
+  (cond
+    (and (map? e) (get e :code)) (str (get e :code))
+    (string? e)
+      (let (i (index-of e ": "))
+        (if (and (> i 0) (< i 40) (< (index-of (string/substring e 0 i) " ") 0))
+          (string/substring e 0 i)
+          "error"))
+    :else "error"))
+
+(defn error-backtrace (e)
+  "The frames of a caught error as strings, oldest last — `[]` for a raised string."
+  (if (map? e)
+    (vec (map (or (get e :trace) []) (fn (frame) (str (get frame :fn "?")))))
+    []))
+
+(defn error-report (e meta)
+  "The report a provider receives for a caught error `e` (a string or a fault map) and
+  the caller's `meta` (`:action`, `:namespace`, `:tags`, `:params`)."
+  {:ts (os/now)
+   :name (error-name e)
+   :message (error-message e)
+   :backtrace (error-backtrace e)
+   :action (get meta :action)
+   :namespace (get meta :namespace "app")
+   :tags (get meta :tags {})
+   :params (get meta :params {})})
+
+(defn report (e &optional (meta {}))
+  "Report a caught error `e` — the value a `catch` bound — to the provider. `meta`:
+  `:action` (what was running, e.g. `\"GET /packages/:name\"`), `:namespace` (default
+  `\"app\"`), `:tags` and `:params` (string-valued maps). Returns nil."
+  (submit :errors (error-report e meta)))
+
+;; ---- hatch --------------------------------------------------------------------------
+
+(defn request-timing (measurements metadata)
+  "The metric for one `[:hatch :request :stop]` event: `request_duration` tagged by the
+  matched route (the pattern, so the tag set is bounded), method and status."
+  {:name "request_duration"
+   :kind :timing
+   :value (get measurements :duration 0)
+   :tags {:route (str (or (get metadata :route) (get metadata :path) "?"))
+          :method (str (get metadata :method "?"))
+          :status (str (get metadata :status "?"))}})
+
+(defn request-error (metadata)
+  "The report for one `[:hatch :request :exception]` event."
+  (error-report (get metadata :error "handler raised")
+    {:action (str (get metadata :method "?") " " (get metadata :path "?"))
+     :namespace "web"
+     :tags {:method (str (get metadata :method "?")) :path (str (get metadata :path "?"))}}))
+
+(defn attach-hatch (&optional (opts {}))
+  "Attach to the events hatch's `http/server` emits: every handled request becomes a
+  `request_duration` timing, every crashed handler an error report. Starts the telemetry
+  listener if it is not running. `opts` `:id` (default `:observe-hatch`) names the
+  handlers for `detach-hatch`."
+  (when (nil? (telemetry/pid)) (telemetry/start))
+  (let (id (get opts :id :observe-hatch))
+    (telemetry/attach [id :stop]
+      [:hatch :request :stop]
+      (fn (_ measurements metadata) (submit :metrics (request-timing measurements metadata))))
+    (telemetry/attach [id :exception]
+      [:hatch :request :exception]
+      (fn (_ _ metadata) (submit :errors (request-error metadata))))
+    id))
+
+(defn detach-hatch (&optional (opts {}))
+  "Remove the handlers `attach-hatch` installed."
+  (let (id (get opts :id :observe-hatch))
+    (telemetry/detach [id :stop])
+    (telemetry/detach [id :exception])
+    nil))
+
+;; ---- a provider for tests -----------------------------------------------------------
+
+(gen/defserver recorder
+  (state)
+  "Holds every batch a `memory-provider` was handed, as `[kind context batch]`."
+  (cast [:shipped entry] (conj state entry))
+  (query :shipped state))
+
+(defrecord memory (pid fail?))
+
+(impl Provider
+  memory
+  (ship-logs [p context records] (record p :logs context records))
+  (ship-metrics [p context metrics] (record p :metrics context metrics))
+  (ship-errors [p context reports] (record p :errors context reports)))
+
+(defn- record (p kind context batch)
+  (if (get p :fail?)
+    [:error "memory-provider: refusing"]
+    (do (gen/cast (get p :pid) [:shipped [kind context batch]]) :ok)))
+
+(defn memory-provider (&optional (opts {}))
+  "A provider that keeps what it is handed, for tests and for developing a new provider
+  against. `(shipped p)` reads it back. `{:fail? true}` makes every ship fail."
+  (memory (gen/start recorder []) (get opts :fail? false)))
+
+(defn shipped (p)
+  "Every batch a `memory-provider` received, oldest first, as `[kind context batch]`."
+  (gen/call (get p :pid) :shipped))
