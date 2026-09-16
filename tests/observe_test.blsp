@@ -336,3 +336,9 @@
       ;; the batch counts as failed (b refused), which is what the shipper logs
       (assert= 1 (get (observe/stats) :failed))
       (observe/stop))))
+
+(describe "a query with no table"
+  (test "is tagged with a dash, not nil"
+    (assert= "-"
+      (get (get (observe/query-timing {:duration 1} {:op "SELECT" :source nil}) :tags) :source))
+    (assert= "SELECT -" (get (observe/query-error {:op "SELECT" :source nil :error "x"}) :action))))

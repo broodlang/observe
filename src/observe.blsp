@@ -496,15 +496,15 @@
    :name "query_duration"
    :kind :timing
    :value (get measurements :duration 0)
-   :tags {:op (str (get metadata :op "?")) :source (str (get metadata :source "?"))}})
+   :tags {:op (str (or (get metadata :op) "?")) :source (str (or (get metadata :source) "-"))}})
 
 (defn query-error (metadata)
   "The report for one `[:store :query :exception]` event. The SQL rides as a param —
   the parameters do not, they are the data."
   (error-report (get metadata :error "query raised")
-    {:action (str (get metadata :op "?") " " (get metadata :source "?"))
+    {:action (str (or (get metadata :op) "?") " " (or (get metadata :source) "-"))
      :namespace "store"
-     :tags {:op (str (get metadata :op "?")) :source (str (get metadata :source "?"))}
+     :tags {:op (str (or (get metadata :op) "?")) :source (str (or (get metadata :source) "-"))}
      :params {:sql (str (get metadata :sql ""))}}))
 
 (def *store-events*
