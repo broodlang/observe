@@ -32,7 +32,9 @@
         (assert= "test" (get context :env))
         (assert= "observe" (get context :app))
         (is (string? (get context :hostname)))
-        (assert= [{:name "queue_depth" :kind :gauge :value 7 :tags {:queue "mail"}}] batch))
+        (assert= [{:name "queue_depth" :kind :gauge :value 7 :tags {:queue "mail"}}]
+          (vec (map batch (fn (m) (dissoc m :ts)))))
+        (is (int? (get (first batch) :ts))))
       (observe/stop)))
 
   (test "counter defaults to one, timing carries the sample"
@@ -171,8 +173,9 @@
               :kind :timing
               :value 12
               :tags {:route "/packages/:name" :method "GET" :status "200"}}
-      (observe/request-timing {:duration 12}
-        {:method "GET" :path "/packages/x" :status 200 :route "/packages/:name"})))
+      (dissoc (observe/request-timing {:duration 12}
+                {:method "GET" :path "/packages/x" :status 200 :route "/packages/:name"})
+        :ts)))
 
   (test "without a route the path stands in"
     (assert= "/health"

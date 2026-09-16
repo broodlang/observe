@@ -64,9 +64,9 @@
 
   - `ship-logs`: `records` is a vector of `{:ts <epoch ms> :level :info :message \"…\"
     :meta {…}}`.
-  - `ship-metrics`: `metrics` is a vector of `{:name \"…\" :kind :gauge|:counter|:timing
+  - `ship-metrics`: `metrics` is a vector of `{:ts <epoch ms> :name \"…\" :kind :gauge|:counter|:timing
     :value <number> :tags {…}}`.
-  - `ship-errors`: `reports` is a vector of `{:ts :name :message :backtrace [\"…\"]
+  - `ship-errors`: `reports` is a vector of `{:ts :level :name :message :backtrace [\"…\"]
     :action :namespace :tags {…} :params {…}}`."
   (ship-logs [self context records] :-> any)
   (ship-metrics [self context metrics] :-> any)
@@ -281,7 +281,7 @@
 ;; ---- metrics ----------------------------------------------------------------------
 
 (defn- metric (name kind value tags)
-  (submit :metrics {:name name :kind kind :value value :tags (or tags {})}))
+  (submit :metrics {:ts (os/now) :name name :kind kind :value value :tags (or tags {})}))
 
 (defn gauge (name value &optional tags)
   "Record `value` as the current level of `name` (a queue depth, a pool size)."
@@ -318,8 +318,9 @@
 
 (defn error-report (e meta)
   "The report a provider receives for a caught error `e` (a string or a fault map) and
-  the caller's `meta` (`:action`, `:namespace`, `:tags`, `:params`)."
+  the caller's `meta` (`:level`, `:action`, `:namespace`, `:tags`, `:params`)."
   {:ts (os/now)
+   :level (get meta :level :error)
    :name (error-name e)
    :message (error-message e)
    :backtrace (error-backtrace e)
@@ -330,8 +331,9 @@
 
 (defn report (e &optional (meta {}))
   "Report a caught error `e` — the value a `catch` bound — to the provider. `meta`:
-  `:action` (what was running, e.g. `\"GET /packages/:name\"`), `:namespace` (default
-  `\"app\"`), `:tags` and `:params` (string-valued maps). Returns nil."
+  `:level` (`:error`, the default, `:warning` or `:fatal`), `:action` (what was running,
+  e.g. `\"GET /packages/:name\"`), `:namespace` (default `\"app\"`), `:tags` and `:params`
+  (string-valued maps). Returns nil."
   (submit :errors (error-report e meta)))
 
 ;; ---- hatch --------------------------------------------------------------------------
@@ -339,7 +341,8 @@
 (defn request-timing (measurements metadata)
   "The metric for one `[:hatch :request :stop]` event: `request_duration` tagged by the
   matched route (the pattern, so the tag set is bounded), method and status."
-  {:name "request_duration"
+  {:ts (os/now)
+   :name "request_duration"
    :kind :timing
    :value (get measurements :duration 0)
    :tags {:route (str (or (get metadata :route) (get metadata :path) "?"))

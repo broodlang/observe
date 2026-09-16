@@ -44,10 +44,32 @@ the oldest half is dropped and counted. A failing provider is warned about once 
 ```
 
 `context` is `{:hostname :env :revision :app}`. Records are
-`{:ts :level :message :meta}`, metrics `{:name :kind :value :tags}` (`:gauge` /
-`:counter` / `:timing`), reports `{:ts :name :message :backtrace :action :namespace :tags
+`{:ts :level :message :meta}`, metrics `{:ts :name :kind :value :tags}` (`:gauge` /
+`:counter` / `:timing`), reports `{:ts :level :name :message :backtrace :action :namespace :tags
 :params}`. A raise inside an op counts as a failure. `(observe/memory-provider)` records
 everything it is handed — the thing to test a new provider, or an app's wiring, against.
+
+### The vocabulary against other vendors' APIs
+
+The three shapes were checked against the public ingestion APIs of AppSignal, Sentry,
+Honeybadger, Datadog, New Relic and OTLP (2026-09), so a provider for any of them is a
+mapping and not a redesign. What each needs from a record, and where it comes from:
+
+| vendor | logs | metrics | errors |
+|---|---|---|---|
+| AppSignal | `/logs/json` NDJSON: `timestamp` RFC 3339, `group`, `severity`, `message`, `hostname`, flat `attributes` | `/metrics/json`: `name`, `metricType` gauge/counter/timing, `value`, string `tags` | `/errors`, one per request: `timestamp` (s), `action`, `namespace`, `error {name message backtrace}`, `revision`, `tags`, `params`, `environment` |
+| Sentry | envelope `log` item, ≤100 per envelope: `timestamp` (s), `trace_id` (provider generates), `level` trace…fatal, `body`, typed `attributes` | envelope metric items (beta): `count`/`gauge`/`distribution` (timing → distribution), `timestamp` | envelope `event`: `event_id` (provider generates), `timestamp`, `platform`, `level`, `transaction` (= `:action`), `server_name`, `release` (= `:revision`), `environment`, `tags`, `extra` (= `:params`), `exception.values[{type value stacktrace.frames}]` |
+| Honeybadger | Insights events `/v1/events` NDJSON: `ts` + arbitrary fields | (events) | `/v1/notices`: `error {class message tags backtrace [{method}]}`, `request {component action params}`, `server {environment_name hostname revision}` |
+| Datadog | `/api/v2/logs` array: `message`, `status`, `hostname`, `service` (= `:app`), `ddsource`, `ddtags`, attributes | `/api/v2/series`: `metric`, `type` count/gauge, `points [{timestamp value}]`, `tags ["k:v"]`; timing → `/api/v1/distribution_points` | error tracking via logs: `error.kind`, `error.message`, `error.stack` |
+| New Relic | Log API `[{common {attributes}, logs [{timestamp message attributes}]}]` | Metric API: `name`, `type` gauge/count/summary, `value`, `timestamp`, `interval.ms` for counts; timing → summary | Event API / a log with `error.class` and `error.message` |
+| OTLP/HTTP | `logRecords`: `timeUnixNano`, `severityText`/`severityNumber`, `body`, `attributes`; resource = context | `gauge`/`sum` (delta)/`histogram` data points with `timeUnixNano` | a log record with `exception.type`, `exception.message`, `exception.stacktrace` |
+
+Two things every record carries because of this table: a metric has a `:ts` (Datadog,
+New Relic and OTLP refuse a point without one; AppSignal ignores it), and an error report
+has a `:level` (`:error` by default — Sentry grades events, nobody else does). The
+per-vendor extras — Sentry's `event_id` and `trace_id`, Honeybadger's `notifier`,
+Datadog's `ddsource` — are a provider's own business. The buffering defaults (100 per
+batch, 5 s, 1000 queued, drop beyond) are the ones Sentry's SDK specification mandates.
 
 ## Development
 
