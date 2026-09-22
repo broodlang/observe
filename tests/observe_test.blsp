@@ -211,7 +211,7 @@
 (describe "the failure streak"
   :isolated (test "a provider that keeps failing is warned about once, until it recovers"
     (let (me (self)
-          provider (fresh {:fail? true}))
+          _ (fresh {:fail? true}))
       (log/start-logger {:level :debug
                          :backends [(log/fn-backend (fn (line) (send me [:line line])))]})
       (observe/gauge "x" 1)
@@ -232,7 +232,7 @@
     (let (provider (fresh))
       (observe/attach-crashes)
       (spawn (fn () (error "worker/step: bad input: " 42)))
-      (spawn (fn () (+ 1 "x")))
+      (check-allow :type-mismatch (spawn (fn () (+ 1 "x"))))
       (spawn (fn () nil))
       (sleep 100)
       (observe/flush-sync)

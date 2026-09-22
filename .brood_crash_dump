@@ -148,3 +148,45 @@ version: 0.29.2 (e8caa1a0-dirty)
 when:    2026-09-16 16:14:43 UTC (1789575283234 ms since epoch)
 process: 84
 reason:  error: loop/step: again
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346382 ms since epoch)
+process: 74
+reason:  235:49: type error: +: expected number, got string ("x")
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346382 ms since epoch)
+process: 73
+reason:  error: worker/step: bad input: 42
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346505 ms since epoch)
+process: 81
+reason:  error: loop/step: again
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346505 ms since epoch)
+process: 84
+reason:  error: loop/step: again
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346505 ms since epoch)
+process: 82
+reason:  error: loop/step: again
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346505 ms since epoch)
+process: 83
+reason:  error: loop/step: again
+
+=== brood process death ===
+version: 0.32.0 (ac366fd5-dirty)
+when:    2026-09-22 18:55:46 UTC (1790103346505 ms since epoch)
+process: 85
+reason:  error: loop/step: again
