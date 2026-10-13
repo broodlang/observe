@@ -7,3 +7,6 @@ _deps/
 # Editor / OS cruft
 *.swp
 .DS_Store
+
+# Crash artifacts written by brood/nest into the working directory
+.brood_crash_dump
