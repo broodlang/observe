@@ -151,7 +151,8 @@
     (assert= "error" (observe/error-name "a sentence with spaces: then a colon")))
 
   (test "a runtime fault carries its code and frames"
-    (let (fault (try (+ 1 "x") (catch e e))
+    ;; check-allow: the type error is the fault under test.
+    (let (fault (check-allow :type-mismatch (try (+ 1 "x") (catch e e)))
           report (observe/error-report fault {}))
       (assert= "E0030" (get report :name))
       (is (includes? (get report :message) "expected number"))

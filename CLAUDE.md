@@ -13,8 +13,9 @@ metrics and error reports and hands each batch to a `Provider` in a worker. Read
   is registered by name, so two in parallel would stop each other. Pure helpers stay in
   parallel groups.
 - A `defrecord` in this package has the id `:observe/observe/<name>`; an `impl` names it
-  bare. An ability from another module (`log/LogBackend`) must be imported bare with
-  `(:use log :only [LogBackend])` before `impl` — a qualified name there registers under
-  a name the logger never dispatches on.
+  bare. An ability from another module (`log/LogBackend`) is named bare in `impl` too — a
+  qualified name there registers under a name the logger never dispatches on. Ability names
+  are not module globals, so there is nothing to import: load the module (`(:alias log)`);
+  `(:use log :only [LogBackend])` refers nothing, and `nest check` says so.
 - Run the one test file (the full suite is blocked on this machine) and `nest format`
   before committing. No trailing `!`, no abbreviations.

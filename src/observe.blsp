@@ -44,9 +44,9 @@
   (:alias math)
   ; whereis / register — the shipper is addressed by name so callers never hold a pid
   (:alias proc)
-  ; the ability an `impl` names must be visible bare — a qualified `log/LogBackend` there
-  ; registers under a name the logger never dispatches on
-  (:use log :only [LogBackend])
+  ; `impl` names the ability bare — a qualified `log/LogBackend` registers under a name the
+  ; logger never dispatches on. Ability names are not module globals, so there is nothing to
+  ; import: the alias loads `log`.
   (:alias log)
   (:alias telemetry)
   (:alias timer)
