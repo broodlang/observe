@@ -3,7 +3,7 @@
 (project
   :name "observe"
   :version "0.1.0"
-  :brood ">= 0.38.0"
+  :brood ">= 0.40.0"
   :description
     "Ship logs, metrics and errors to a monitoring provider — batched, bounded, off the request path. Vendor-neutral; pair with a provider package such as observe-appsignal."
   :repository "https://github.com/broodlang/observe")
