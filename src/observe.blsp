@@ -587,3 +587,68 @@
 (defn shipped (p)
   "Every batch a `memory-provider` received, oldest first, as `[kind context batch]`."
   (gen/call (get p :pid) :shipped))
+
+;; ---- booting an app -------------------------------------------------------------------
+
+(def *variables*
+  ;; Every variable `settings` reads, so `from-environment` and the docs cannot disagree.
+  ["OBSERVE_APP" "OBSERVE_ENV" "OBSERVE_LOG_LEVEL" "FLY_APP_NAME" "HATCH_ENV" "FLY_MACHINE_VERSION"])
+
+(defn- env-text (env variable)
+  "`variable`'s value in `env`, trimmed; nil when it is unset or blank — a blank is what a
+  deploy tool writes for a secret it could not find."
+  (let (raw (get env variable))
+    (when (and (string? raw) (not (string/blank? raw))) (string/trim raw))))
+
+(defn settings (env fallback-app)
+  "What a run is filed under, from an environment map (`var → value`) — pure, because the
+  real environment cannot be set from a test. The names come from the deployment, not the
+  code, because they are what tell one deployment of the same code from another:
+
+  - `:app` — `$OBSERVE_APP`, else Fly's `$FLY_APP_NAME`, else `fallback-app`.
+  - `:env` — `$OBSERVE_ENV`, else the build's `$HATCH_ENV`, else `\"dev\"`.
+  - `:revision` — `$FLY_MACHINE_VERSION`, which changes on every deploy (a vendor's deploy
+    markers line up with it).
+  - `:log-level` — `$OBSERVE_LOG_LEVEL` as a keyword, default `:info`: the floor for
+    shipped log lines.
+
+      (observe/settings {} \"shop\") ;=> {:app \"shop\" :env \"dev\" :revision nil :log-level :info}"
+  {:app (or (env-text env "OBSERVE_APP") (env-text env "FLY_APP_NAME") fallback-app)
+   :env (or (env-text env "OBSERVE_ENV") (env-text env "HATCH_ENV") "dev")
+   :revision (env-text env "FLY_MACHINE_VERSION")
+   :log-level (keyword (or (env-text env "OBSERVE_LOG_LEVEL") "info"))})
+
+(defn from-environment (fallback-app)
+  "`settings` over the process environment."
+  (settings (into {} (map *variables* (fn (variable) [variable (os/env variable)])))
+    fallback-app))
+
+(defn boot (config providers)
+  "Start monitoring an app: the shipper over `providers` (several fan out; a nil one — a
+  vendor that is not configured — is dropped), every log line at or above `config`'s
+  `:log-level`, and `attach-all`. `config` is `settings`' map.
+
+      (observe/boot (observe/from-environment \"shop\")
+        [(observe-local/provider) (observe-appsignal/from-environment \"shop\")])
+
+  Meant as a boot child, after the logger (so the first line shipped can be its own) and
+  before the endpoint (so no request goes unobserved). **Never raises**: a boot child that
+  raises aborts the boot, and monitoring is the one subsystem whose absence must not cost
+  the site, so a failure is a warning in the log. Returns nil."
+  (try
+    (let (present (seq/reject providers nil?))
+      (when (empty? present) (error "no provider"))
+      (start {:provider (if (= 1 (count present)) (first present) (fan-out-provider present))
+              :app (get config :app)
+              :env (get config :env)
+              :revision (get config :revision)})
+      (log/add-backend (log-backend {:min-level (get config :log-level)}))
+      (attach-all)
+      (log/info "monitoring: on"
+        {:app (get config :app)
+         :env (get config :env)
+         :revision (get config :revision)
+         :providers (count present)}))
+    (catch e
+      (log/warn (str "monitoring: not started — " (error-message e)) {:error (error-message e)})))
+  nil)
