@@ -151,7 +151,7 @@
   (info :tick (flush-all state))
   (info [:flushed kind shipped result]
     (let (landed (assoc (note-result state kind shipped result)
-                   :in-flight (disj (get state :in-flight) kind)))
+                   :in-flight (set/disj (get state :in-flight) kind)))
       ;; More than a batch arrived while this one was out: keep going rather than
       ;; wait a whole tick.
       (if (>= (count (get landed kind)) (get landed :max-batch)) (flush-kind landed kind) landed)))
@@ -243,7 +243,7 @@
                             (get (get s :pending) :errors))))
                         true
                       (> (os/now) deadline) false
-                      :else (do (sleep 10) (flush) (wait deadline))))))
+                      :else (do (proc/sleep 10) (flush) (wait deadline))))))
     (wait (+ (os/now) timeout-ms))))
 
 (defn- submit (kind entry)
