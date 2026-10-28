@@ -310,6 +310,9 @@
   raised string, or a user fault whose message is one, groups by its `fn-name:` prefix;
   anything else is `error`."
   (cond
+    ;; `error` raises a map with a code too (`E0090`, brood ADR-501), the same for every
+    ;; user fault — group those by what the message names instead
+    (and (map? e) (= (get e :kind) :error)) (name-from-message (str (get e :message "")))
     (and (map? e) (get e :code)) (str (get e :code))
     (map? e) (name-from-message (str (get e :message "")))
     (string? e) (name-from-message e)
