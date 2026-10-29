@@ -10,7 +10,7 @@ in an isolated listener). `observe` is the part that gets a record *out* of the 
 
 ## Usage
 
-```brood
+```brood fragment
 (observe/start {:provider (observe-appsignal/provider {:api-key … :log-key …})
                 :env "prod" :revision "abc123" :app "hive"})
 
@@ -33,7 +33,7 @@ instrumentation — the Phoenix/Ecto-integration idea:
 Each piece is also separate — `attach-hatch`, `attach-store`, `attach-crashes` — and the
 rest is by hand:
 
-```brood
+```brood fragment
 (log/add-backend (observe/log-backend {:min-level :info}))   ; every log line
 (observe/report caught-error {:action "nightly-sync"})       ; a caught error
 (observe/gauge "queue_depth" 42 {:queue "mail"})
@@ -47,7 +47,7 @@ rest is by hand:
 Several providers at once — a local copy next to the vendor
 ([`observe-local`](../observe-local)), or two vendors while migrating:
 
-```brood
+```brood fragment
 (observe/fan-out-provider [(observe-local/provider) (observe-appsignal/provider {…})])
 ```
 
