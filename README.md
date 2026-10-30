@@ -63,9 +63,9 @@ the oldest half is dropped and counted. A failing provider is warned about once 
 (defrecord my-provider (endpoint key))
 
 (impl observe/Provider my-provider
-  (ship-logs    [p context records] …)   ; → :ok | [:error message]
-  (ship-metrics [p context metrics] …)
-  (ship-errors  [p context reports] …))
+  (ship-logs    (p context records) …)   ; → :ok | [:error message]
+  (ship-metrics (p context metrics) …)
+  (ship-errors  (p context reports) …))
 ```
 
 `context` is `{:hostname :env :revision :app}`. Records are

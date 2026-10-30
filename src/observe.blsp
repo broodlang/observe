@@ -68,9 +68,9 @@
     :value <number> :tags {…}}`.
   - `ship-errors`: `reports` is a vector of `{:ts :level :name :message :backtrace [\"…\"]
     :action :namespace :tags {…} :params {…}}`."
-  (ship-logs [self context records] :-> any)
-  (ship-metrics [self context metrics] :-> any)
-  (ship-errors [self context reports] :-> any))
+  (ship-logs (self context records) :-> any)
+  (ship-metrics (self context metrics) :-> any)
+  (ship-errors (self context reports) :-> any))
 
 ;; ---- the shipper ------------------------------------------------------------------
 
@@ -266,7 +266,7 @@
 ;; `backend-emit` runs in the logger process, so the gate is the only work done there.
 (impl LogBackend
   backend
-  (backend-emit [b record]
+  (backend-emit (b record)
     (when (and (log/backend-passes? b record)
             ;; never re-ship the shipper's own warnings — see the header
             (not (get (or (get record :meta) {}) :observe)))
@@ -548,11 +548,11 @@
 
 (impl Provider
   fan-out
-  (ship-logs [f context records]
+  (ship-logs (f context records)
     (each-provider (get f :providers) (fn (p) (ship-logs p context records))))
-  (ship-metrics [f context metrics]
+  (ship-metrics (f context metrics)
     (each-provider (get f :providers) (fn (p) (ship-metrics p context metrics))))
-  (ship-errors [f context reports]
+  (ship-errors (f context reports)
     (each-provider (get f :providers) (fn (p) (ship-errors p context reports)))))
 
 (defn fan-out-provider (providers)
@@ -573,9 +573,9 @@
 
 (impl Provider
   memory
-  (ship-logs [p context records] (record p :logs context records))
-  (ship-metrics [p context metrics] (record p :metrics context metrics))
-  (ship-errors [p context reports] (record p :errors context reports)))
+  (ship-logs (p context records) (record p :logs context records))
+  (ship-metrics (p context metrics) (record p :metrics context metrics))
+  (ship-errors (p context reports) (record p :errors context reports)))
 
 (defn- record (p kind context batch)
   (if (get p :fail?)
