@@ -243,7 +243,7 @@
                             (get (get s :pending) :errors))))
                         true
                       (> (os/now) deadline) false
-                      :else (do (proc/sleep 10) (flush) (wait deadline))))))
+                      else (do (proc/sleep 10) (flush) (wait deadline))))))
     (wait (+ (os/now) timeout-ms))))
 
 (defn- submit (kind entry)
@@ -316,7 +316,7 @@
     (and (map? e) (get e :code)) (str (get e :code))
     (map? e) (name-from-message (str (get e :message "")))
     (string? e) (name-from-message e)
-    :else "error"))
+    else "error"))
 
 (defn error-backtrace (e)
   "The frames of a caught error as strings, innermost first — the raise site (when the
