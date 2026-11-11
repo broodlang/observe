@@ -467,7 +467,7 @@
 
 (defn- attach-table (id table)
   (when (nil? (telemetry/pid)) (telemetry/start))
-  (dolist (row table)
+  (doseq (row table)
     (let ([suffix event kind build] row)
       (telemetry/attach [id suffix]
         event
@@ -475,7 +475,7 @@
   id)
 
 (defn- detach-table (id table)
-  (dolist (row table) (telemetry/detach [id (first row)]))
+  (doseq (row table) (telemetry/detach [id (first row)]))
   nil)
 
 (defn attach-hatch (&optional (opts {}))
