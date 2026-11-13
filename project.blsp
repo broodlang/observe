@@ -2,8 +2,8 @@
 ;; provider is any value with a `Provider` impl (observe-appsignal is the first).
 (project
   :name "observe"
-  :version "0.2.4"
-  :brood ">= 0.51.0"
+  :version "0.2.5"
+  :brood ">= 0.52.0"
   :description
     "Ship logs, metrics and errors to a monitoring provider — batched, bounded, off the request path. Vendor-neutral; pair with a provider package such as observe-appsignal."
   :repository "https://github.com/broodlang/observe")
