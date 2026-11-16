@@ -1,0 +1,23 @@
+name: CI
+
+# Thin caller. The gate itself — build brood, `nest check`, `nest format --check`,
+# `nest test` — lives once in broodlang/brood/.github/workflows/package-ci.yml, so a
+# change to what "green" means is one edit rather than one per repo.
+#
+# It tracks brood `main` on purpose: a package pinned by git ref with no CI is a package
+# whose breakage is found by whoever deploys it, which is how hatch stayed broken across
+# two releases.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: broodlang/brood/.github/workflows/package-ci.yml@main
