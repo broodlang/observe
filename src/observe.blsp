@@ -384,14 +384,14 @@
   "`seen` is site → when it was last reported: a supervised worker in a restart loop is
   one report a minute, not one per restart."
   (receive
-    ([:system :exit pid reason] (let (report (crash-report pid reason)
-                                      site (when report (crash-site report))
-                                      last (when site (get seen site))
-                                      now (os/now))
-                                  (if (and report
-                                        (or (nil? last) (> (- now last) *crash-interval-ms*)))
-                                    (do (submit :errors report) (crash-loop (assoc seen site now)))
-                                    (crash-loop seen))))
+    ([:system :exit pid reason]
+      (let (report (crash-report pid reason)
+            site (when report (crash-site report))
+            last (when site (get seen site))
+            now (os/now))
+        (if (and report (or (nil? last) (> (- now last) *crash-interval-ms*)))
+          (do (submit :errors report) (crash-loop (assoc seen site now)))
+          (crash-loop seen))))
     (:stop (do (proc/system-monitor nil) nil))
     (_ (crash-loop seen))))
 
